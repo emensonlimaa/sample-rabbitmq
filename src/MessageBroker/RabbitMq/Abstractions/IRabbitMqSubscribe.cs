@@ -1,7 +1,7 @@
 ﻿namespace MessageBroker.RabbitMq.Abstractions;
 
-public interface IRabbitMqSubscribe : IDisposable
+public interface IRabbitMqSubscribe
 {
-    void Subscribe(string exchangeName, string routingKey, string exchangeType, string queueName,
+    Task Subscribe(string exchangeName, string routingKey, string exchangeType, string queueName,
         IEventHandler handler);
 }

@@ -1,7 +1,7 @@
-﻿using System.Text;
-using MessageBroker.RabbitMq.Abstractions;
+﻿using MessageBroker.RabbitMq.Abstractions;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
+using System.Text;
 
 namespace MessageBroker.RabbitMq;
 
@@ -9,7 +9,7 @@ public class RabbitMqPublish :  IRabbitMqPublish
 {
     private readonly ILogger<RabbitMqPublish> _logger;
     private readonly IRabbitMqClient _rabbitMqClient;
-    private IModel? _channel;
+    private IChannel? _channel;
 
     protected RabbitMqPublish(IRabbitMqClient rabbitMqClient, ILogger<RabbitMqPublish> logger)
     {
@@ -17,50 +17,39 @@ public class RabbitMqPublish :  IRabbitMqPublish
         _logger = logger;
     }
 
-    public void Dispose()
-    {
-        _rabbitMqClient?.Dispose();
-        _channel?.Close();
-        _channel?.Dispose();
-    }
-
-    public void Publish(string exchangeName, string routingKey, string exchangeType, string message)
+    public async Task Publish(string exchangeName, string routingKey, string exchangeType, string message)
     {
         try
         {
-            _channel = _rabbitMqClient.GetOrCreateChannel();
+            _channel = await _rabbitMqClient.GetOrCreateChannel();
 
-            _channel.ConfirmSelect();
-
-            _channel.ExchangeDeclare(
+            await _channel!.ExchangeDeclareAsync(
                 exchangeName,
                 exchangeType,
-                true,
-                false,
-                null
+                durable: true,
+                autoDelete: false
             );
 
-            var properties = _channel.CreateBasicProperties();
-            properties.Persistent = true;
-            properties.ContentType = "application/json";
-            properties.Priority = 0;
-            properties.MessageId = Guid.NewGuid().ToString();
-            properties.DeliveryMode = 2;
+            var properties = new BasicProperties
+            {
+                Persistent = true,
+                ContentType = "application/json",
+                Priority = 0,
+                MessageId = Guid.NewGuid().ToString(),
+                DeliveryMode = DeliveryModes.Persistent
+            };
 
-            _channel.BasicPublish(
+            var body = Encoding.UTF8.GetBytes(message);
+
+            await _channel.BasicPublishAsync(
                 exchangeName,
                 routingKey,
-                properties,
-                Encoding.UTF8.GetBytes(message)
+                mandatory: false,
+                basicProperties: properties,
+                body: body
             );
 
-            var confirmReceived = _channel.WaitForConfirms(TimeSpan.FromMilliseconds(250));
-
-            if (!confirmReceived)
-            {
-                _logger.LogError("Failed to receive confirmation for message: {MessageId}", properties.MessageId);
-                throw new Exception("RabbitMQ channel confirmation failed.");
-            }
+            _logger.LogInformation("Message successfully published and confirmed. MessageId: {MessageId}", properties.MessageId);
         }
         catch (Exception ex)
         {

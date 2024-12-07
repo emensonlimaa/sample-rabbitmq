@@ -2,7 +2,7 @@
 
 namespace MessageBroker.RabbitMq.Abstractions;
 
-public interface IRabbitMqClient : IDisposable
+public interface IRabbitMqClient
 {
-    IModel? GetOrCreateChannel();
+    Task<IChannel?> GetOrCreateChannel();
 }

@@ -1,5 +1,4 @@
-﻿using System.Text;
-using MessageBroker.Configuration;
+﻿using MessageBroker.Configuration;
 using MessageBroker.RabbitMq.Abstractions;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
@@ -7,142 +6,131 @@ using RabbitMQ.Client.Events;
 
 namespace MessageBroker.RabbitMq;
 
-public  class RabbitMqClient : IRabbitMqClient
+public class RabbitMqClient : IRabbitMqClient, IAsyncDisposable
 {
     private static readonly string AppName = AppDomain.CurrentDomain.FriendlyName;
-    private readonly IConnectionFactory _factory = GetConnectionFactory();
-    private readonly object _lockObject = new();
+    private readonly ConnectionFactory _factory;
     private readonly ILogger _logger;
-    private static readonly string MachineName = Environment.MachineName;
-    private IModel? _channel;
     private IConnection? _connection;
+    private IChannel? _channel;
     private bool _disposed;
 
     public RabbitMqClient(ILogger<RabbitMqClient> logger)
     {
         _logger = logger;
+        _factory = GetConnectionFactory();
     }
 
-    public void Dispose()
-    {
-        Dispose(true);
-        GC.SuppressFinalize(this);
-    }
-
-    private static IConnectionFactory GetConnectionFactory()
+    private static ConnectionFactory GetConnectionFactory()
     {
         var settings = AppSettingsReader.GetSection<RabbitMqConfiguration>("RabbitMq");
 
-        var factory = new ConnectionFactory
+        return new ConnectionFactory
         {
             HostName = settings.HostName,
             UserName = settings.UserName,
             Password = settings.Password,
             VirtualHost = settings.VirtualHost,
             Port = settings.Port,
-            ClientProvidedName = $"App: {AppName}, Machine: {MachineName}",
-            RequestedConnectionTimeout = TimeSpan.FromMicroseconds(settings.RequestedConnectionTimeout),
-            SocketReadTimeout = TimeSpan.FromMicroseconds(settings.SocketReadTimeout),
-            SocketWriteTimeout = TimeSpan.FromMicroseconds(settings.SocketWriteTimeout),
+            ClientProvidedName = $"App: {AppName}, Machine: {Environment.MachineName}",
+            RequestedConnectionTimeout = TimeSpan.FromMilliseconds(settings.RequestedConnectionTimeout),
+            SocketReadTimeout = TimeSpan.FromMilliseconds(settings.SocketReadTimeout),
+            SocketWriteTimeout = TimeSpan.FromMilliseconds(settings.SocketWriteTimeout),
             AutomaticRecoveryEnabled = settings.AutomaticRecoveryEnabled,
-            NetworkRecoveryInterval = TimeSpan.FromMicroseconds(settings.NetworkRecoveryInterval),
-            TopologyRecoveryEnabled = settings.TopologyRecoveryEnabled,
-            DispatchConsumersAsync = settings.DispatchConsumersAsync
+            NetworkRecoveryInterval = TimeSpan.FromMilliseconds(settings.NetworkRecoveryInterval),
+            TopologyRecoveryEnabled = settings.TopologyRecoveryEnabled
         };
-        
-        return factory;
     }
 
-    public IModel? GetOrCreateChannel()
+    public async Task<IChannel?> GetOrCreateChannel()
     {
         if (_disposed)
-            throw new ObjectDisposedException("RabbitMqClient", "Attempting to use a disposed RabbitMqClient.");
+            throw new ObjectDisposedException(nameof(RabbitMqClient), "Attempting to use a disposed RabbitMqClient.");
 
-        lock (_lockObject)
-        {
-            if (_channel is { IsOpen: true })
-                return _channel;
-
-            if (_connection is { IsOpen: true })
-                _connection = CreateConnection();
- 
-            _channel = _connection.CreateModel();
-
-            RegisterChannelEvents();
-            _logger.LogInformation("RabbitMQ channel created successfully.");
+        if (_channel != null && _channel.IsOpen)
             return _channel;
-        }
+
+        if (_connection == null || !_connection.IsOpen)
+            _connection = await CreateConnection();
+
+        _channel = await _connection.CreateChannelAsync();
+
+        _logger.LogInformation($"RabbitMQ channel: {_channel.ChannelNumber} created successfully. ");
+        return _channel;
     }
 
-    private IConnection? CreateConnection()
+    private async Task<IConnection> CreateConnection()
     {
-        lock (_lockObject)
+        _logger.LogInformation("Establishing RabbitMQ connection...");
+        var connection = await _factory.CreateConnectionAsync();
+
+        connection.ConnectionShutdownAsync += async (sender, e) =>
         {
-            var connection = _factory.CreateConnection();
-            RegisterConnectionEvents(connection);
-            _logger.LogInformation("RabbitMQ connection established successfully.");
-            return connection;
+            await HandleConnectionShutdown(e);
+        };
+
+        connection.CallbackExceptionAsync += async (sender, e) =>
+        {
+            await HandleCallbackException(e);
+        };
+
+        connection.ConnectionBlockedAsync += async (sender, e) =>
+        {
+            await HandleConnectionBlocked(e);
+        };
+
+        connection.ConnectionUnblockedAsync += async (sender, e) =>
+        {
+            await HandleConnectionUnblocked();
+        };
+
+        _logger.LogInformation($"RabbitMQ connection established successfully: {_connection?.ClientProvidedName}");
+        return connection;
+    }
+
+    private async Task HandleConnectionShutdown(ShutdownEventArgs e)
+    {
+        _logger.LogWarning($"RabbitMQ connection shutdown: {e.ReplyText} - {_connection?.ClientProvidedName}");
+        await Task.CompletedTask;
+    }
+
+    private async Task HandleCallbackException(CallbackExceptionEventArgs e)
+    {
+        _logger.LogError($"RabbitMQ callback exception: {e.Exception.Message} - {_connection?.ClientProvidedName}");
+        await Task.CompletedTask;
+    }
+
+    private async Task HandleConnectionBlocked(ConnectionBlockedEventArgs e)
+    {
+        _logger.LogWarning($"RabbitMQ connection blocked: {e.Reason} - {_connection?.ClientProvidedName}");
+        await Task.CompletedTask;
+    }
+
+    private async Task HandleConnectionUnblocked()
+    {
+        _logger.LogInformation($"RabbitMQ connection unblocked. {_connection?.ClientProvidedName}");
+        await Task.CompletedTask;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed) return;
+
+        if (_channel != null)
+        {
+            await _channel.CloseAsync();
+            _channel.Dispose();
         }
-    }
 
-    private void RegisterConnectionEvents(IConnection connection)
-    {
-        connection.ConnectionShutdown += HandleShutdownEvent;
-        connection.CallbackException += HandleCallbackException;
-        connection.ConnectionBlocked += HandleBlockedEvent;
-        connection.ConnectionUnblocked += HandleUnblockedEvent;
-    }
+        if (_connection != null)
+        {
+            await _connection.CloseAsync();
+            _connection.Dispose();
+        }
 
-    private void RegisterChannelEvents()
-    {
-        _channel.ModelShutdown += HandleShutdownEvent;
-        _channel.CallbackException += HandleCallbackException;
-        _channel.BasicReturn += HandleBasicReturn;
-    }
-
-    private void HandleShutdownEvent(object? sender, ShutdownEventArgs e)
-    {
-        _logger.LogWarning(new StringBuilder().Append("RabbitMQ shutdown: ").Append(e.ReplyText).ToString());
-    }
-
-    private void HandleCallbackException(object? sender, CallbackExceptionEventArgs e)
-    {
-        _logger.LogError(new StringBuilder().Append("RabbitMQ callback exception: ")
-            .Append(e.Exception.Message)
-            .ToString());
-    }
-
-    private void HandleBlockedEvent(object? sender, ConnectionBlockedEventArgs e)
-    {
-        _logger.LogWarning(new StringBuilder().Append("RabbitMQ connection blocked: ").Append(e.Reason).ToString());
-    }
-
-    private void HandleUnblockedEvent(object? sender, EventArgs e)
-    {
-        _logger.LogInformation("RabbitMQ connection unblocked.");
-    }
-
-    private void HandleBasicReturn(object? sender, BasicReturnEventArgs e)
-    {
-        _logger.LogWarning(new StringBuilder().Append("RabbitMQ message return: ").Append(e.ReplyText).ToString());
-    }
-
-    private void Dispose(bool disposing)
-    {
-        if (_disposed)
-            return;
-
-        if (disposing)
-            lock (_lockObject)
-            {
-                _channel?.Close();
-                _connection?.Close();
-                _channel?.Dispose();
-                _connection?.Dispose();
-                _channel = null;
-                _connection = null;
-            }
-
+        _channel = null;
+        _connection = null;
         _disposed = true;
+        _logger.LogInformation("RabbitMQ resources disposed successfully.");
     }
 }
